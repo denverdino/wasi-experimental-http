@@ -1,44 +1,63 @@
 use anyhow::Error;
 use std::time::Instant;
-use wasi_cap_std_sync::WasiCtxBuilder;
-use wasi_experimental_http_wasmtime::HttpCtx;
+use wasi_experimental_http_wasmtime::{HttpCtx, HttpState};
 use wasmtime::*;
-use wasmtime_wasi::Wasi;
+use wasmtime_wasi::sync::WasiCtxBuilder;
+use wasmtime_wasi::*;
 
 fn main() {
     let allowed_domains = Some(vec![
         "http://127.0.0.1:3500".to_string(),
     ]);
     let module = "tests/dapr/build/optimized.wasm";
-    create_instance(module.to_string(), allowed_domains.clone()).unwrap();
+    create_instance(module.to_string(), allowed_domains.clone(), None).unwrap();
 }
 
 /// Create a Wasmtime::Instance from a compiled module and
 /// link the WASI imports.
 fn create_instance(
     filename: String,
-    allowed_domains: Option<Vec<String>>,
-) -> Result<Instance, Error> {
+    allowed_hosts: Option<Vec<String>>,
+    max_concurrent_requests: Option<u32>,
+) -> Result<(Instance, Store<IntegrationTestsCtx>), Error> {
     let start = Instant::now();
-    let store = Store::default();
-    let mut linker = Linker::new(&store);
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
 
-    let ctx = WasiCtxBuilder::new()
+    let wasi = WasiCtxBuilder::new()
         .inherit_stdin()
         .inherit_stdout()
         .inherit_stderr()
-        .build()?;
+        .build();
 
-    let wasi = Wasi::new(&store, ctx);
-    wasi.add_to_linker(&mut linker)?;
+    let http = HttpCtx {
+        allowed_hosts,
+        max_concurrent_requests,
+    };
+
+    let ctx = IntegrationTestsCtx { wasi, http };
+
+    let mut store = Store::new(&engine, ctx);
+    wasmtime_wasi::add_to_linker(
+        &mut linker,
+        |cx: &mut IntegrationTestsCtx| -> &mut WasiCtx { &mut cx.wasi },
+    )?;
+
     // Link `wasi_experimental_http`
-    let http = HttpCtx::new(allowed_domains, None)?;
-    http.add_to_linker(&mut linker)?;
+    let http = HttpState::new()?;
+    http.add_to_linker(&mut linker, |cx: &IntegrationTestsCtx| -> &HttpCtx {
+        &cx.http
+    })?;
 
     let module = wasmtime::Module::from_file(store.engine(), filename)?;
 
-    let instance = linker.instantiate(&module)?;
+    let instance = linker.instantiate(&mut store, &module)?;
     let duration = start.elapsed();
     println!("module instantiation time: {:#?}", duration);
-    Ok(instance)
+    Ok((instance, store))
+}
+
+struct IntegrationTestsCtx {
+    pub wasi: WasiCtx,
+    pub http: HttpCtx,
 }
